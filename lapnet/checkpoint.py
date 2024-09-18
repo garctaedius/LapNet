@@ -19,12 +19,14 @@ import datetime
 import os
 from typing import Optional
 import zipfile
+import functools
 
 from absl import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .allow_multi_node import is_main_process
 
 def find_last_checkpoint(ckpt_path: Optional[str] = None) -> Optional[str]:
   """Finds most recent valid checkpoint in a directory.
@@ -48,7 +50,7 @@ def find_last_checkpoint(ckpt_path: Optional[str] = None) -> Optional[str]:
           np.load(f, allow_pickle=True)
           return fname
         except (OSError, EOFError, zipfile.BadZipFile):
-          logging.info('Error loading checkpoint %s. Trying next checkpoint...',
+          logging.warning('Error loading checkpoint %s. Trying next checkpoint...',
                        fname)
   return None
 
@@ -66,7 +68,7 @@ def create_save_path(save_path: Optional[str]) -> str:
   timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H:%M:%S')
   default_save_path = os.path.join(os.getcwd(), f'ferminet_{timestamp}')
   ckpt_save_path = save_path or default_save_path
-  if ckpt_save_path and not os.path.isdir(ckpt_save_path):
+  if is_main_process() and ckpt_save_path and not os.path.isdir(ckpt_save_path):
     os.makedirs(ckpt_save_path)
   return ckpt_save_path
 
@@ -87,6 +89,17 @@ def get_restore_path(restore_path: Optional[str] = None) -> Optional[str]:
   return ckpt_restore_path
 
 
+def gather_data(data):
+  pgather = functools.partial(jax.lax.all_gather, axis_name="pmap_axis")
+  @functools.partial(jax.pmap, axis_name="pmap_axis")
+  def gather_electrons(electrons):
+     return pgather(electrons, axis=0, tiled=True)
+  electrons = gather_electrons(data)
+  instance = functools.partial(jax.tree_util.tree_map, lambda x: x[0])
+  electrons = instance(electrons)
+  return electrons
+
+
 def save(save_path: str, t: int, data, params, opt_state, mcmc_width, sharded_key) -> str:
   """Saves checkpoint information to a npz file.
 
@@ -104,20 +117,24 @@ def save(save_path: str, t: int, data, params, opt_state, mcmc_width, sharded_ke
   Returns:
     path to checkpoint file.
   """
+  combined_data = gather_data(data)
+
+  if not is_main_process():
+    return
   ckpt_filename = os.path.join(save_path, f'qmcjax_ckpt_{t:06d}.npz')
   logging.info('Saving checkpoint %s', ckpt_filename)
+  instance = functools.partial(jax.tree_util.tree_map, lambda x: x[0])
   with open(ckpt_filename, 'wb') as f:
     np.savez(
         f,
         t=t,
-        data=data,
-        params=params,
-        opt_state=opt_state,
+        data=combined_data,
+        params=instance(params),
+        opt_state=instance(opt_state),
         mcmc_width=mcmc_width,
         sharded_key=sharded_key)
 
   return ckpt_filename
-
 
 def restore(restore_filename: str, batch_size: Optional[int] = None):
   """Restores data saved in a checkpoint.
@@ -148,18 +165,25 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
     # Retrieve data from npz file. Non-array variables need to be converted back
     # to natives types using .tolist().
     t = ckpt_data['t'].tolist() + 1  # Return the iterations completed.
-    data = ckpt_data['data']
+    combined_data = ckpt_data['data']
     params = ckpt_data['params'].tolist()
     opt_state = ckpt_data['opt_state'].tolist()
     mcmc_width = jnp.array(ckpt_data['mcmc_width'].tolist())
     sharded_key = ckpt_data['sharded_key'] if 'sharded_key' in ckpt_data else None
 
-    if data.shape[0] != jax.local_device_count():
-      raise ValueError(
-          'Incorrect number of devices found. Expected {}, found {}.'.format(
-              data.shape[0], jax.local_device_count()))
-    if batch_size and data.shape[0] * data.shape[1] != batch_size:
+    params = jax.tree_util.tree_map(lambda x: x[None, ...], params)
+    opt_state = jax.tree_util.tree_map(lambda x: x[None, ...], opt_state)
+    
+    num_devices = jax.process_count() 
+    sharded_key = jax.random.split(sharded_key[0], num_devices)
+    sharded_key = sharded_key[jax.process_index()]
+
+    if combined_data.shape[0] != batch_size*num_devices:
       raise ValueError(
           'Wrong batch size in loaded data. Expected {}, found {}.'.format(
-              batch_size, data.shape[0] * data.shape[1]))
+              batch_size*num_devices, combined_data.shape[0]))
+
+    data = combined_data.reshape(jax.process_count(), jax.local_device_count(), -1, *combined_data.shape[1:])
+    data = data[jax.process_index()]
+  logging.info("finished restoring")
   return t, data, params, opt_state, mcmc_width, sharded_key

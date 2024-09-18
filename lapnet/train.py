@@ -38,6 +38,7 @@ from lapnet import (
 from lapnet import loss as qmc_loss_functions
 from lapnet import mcmc, networks, pretrain
 from lapnet.utils import det_filter, multi_host, statistics, system, writers
+from .allow_multi_node import is_main_process
 from kfac_jax import utils as kfac_utils
 from typing_extensions import Protocol
 
@@ -254,6 +255,11 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     ValueError: if an illegal or unsupported value in cfg is detected.
   """
   # Device logging
+  # Only log on main process
+  #if int(os.environ.get("SLURM_PROCID", 0)) == 0:
+  #  logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler()])
+  #else:
+  #  logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler()])
   num_devices = jax.local_device_count()
   num_hosts, host_idx = jax.device_count() // num_devices, jax.process_index()
   local_batch_size = cfg.batch_size // num_hosts
@@ -341,13 +347,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   # If restore path is available, we copy everything in restore path over to save path
   # so that it's easier to manage
-  if ckpt_restore_path:
+  if ckpt_restore_path and is_main_process():
       for _f in os.listdir(ckpt_restore_path):
           src_filename = os.path.join(ckpt_restore_path, _f)
           logging.info(f'Copying {src_filename} to {ckpt_save_path}')
           shutil.copy(src_filename, ckpt_save_path)
 
-  ckpt_restore_filename = checkpoint.find_last_checkpoint(ckpt_save_path)
+  ckpt_restore_filename = cfg.log.restore_path_full
 
   if ckpt_restore_filename:
     t_init, data, params, opt_state_ckpt, mcmc_width_ckpt, sharded_key_ckpt = checkpoint.restore(
@@ -370,6 +376,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     opt_state_ckpt = None
     mcmc_width_ckpt = None
     sharded_key_ckpt = None
+
 
   # Set up logging
   train_schema = ['step', 'energy', 'var', 'ewmean', 'ewvar', 'pmove', 'num_outliers', 'num_det']
@@ -547,6 +554,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   step, opt_state, sharded_key = init_step(cfg, params, data, sharded_key,
                                            opt_state_ckpt=opt_state_ckpt)
 
+  logging.info("got to mcmc burn in")
   if mcmc_width_ckpt is not None:
     mcmc_width = kfac_jax.utils.replicate_all_local_devices(mcmc_width_ckpt[0])
   else:
@@ -594,12 +602,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     t_init = 0
 
   if writer_manager is None:
-      writer_manager = writers.Writer(
-          name=cfg.log.stats_file_name,
-          schema=train_schema,
-          directory=ckpt_save_path,
-          iteration_key=None,
-        log=False)
+    if is_main_process():
+            writer_manager = writers.Writer(
+                name=cfg.log.stats_file_name,
+                schema=train_schema,
+                directory=ckpt_save_path,
+                iteration_key=None,
+                log=False)
+    else:
+        writer_manager = writers.DummyWriter()
 
   with writer_manager as writer:
     # Main training loop
@@ -630,7 +641,6 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           state=opt_state,
           key=subkeys,
           mcmc_width=mcmc_width)
-
       # due to pmean, loss, and pmove should be the same across
       # devices.
       loss = loss[0]
@@ -660,7 +670,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         logging.info(
             'Step %05d: %03.4f E_h, batch_var=%03.4f, exp. variance=%03.4f E_h^2, pmove=%0.2f, num_outliers=%d, num_det=%d, time=%.2f',
             t, loss, batch_var, weighted_stats.variance, pmove, num_outliers, num_det, end_time - init_time)
-        writer.write(
+        if writer:
+            writer.write(
             t,
             step=t,
             energy=np.asarray(loss),
@@ -671,12 +682,27 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             num_outliers=np.asarray(num_outliers),
             num_det=np.asarray(num_det))
 
+
+      #logging.info("params: ", jax.tree_util.tree_map(jax.numpy.shape, params))
+      #logging.info("data: ", jax.tree_util.tree_map(jax.numpy.shape, data))
+      #logging.info("opt_state: ", jax.tree_util.tree_map(jax.numpy.shape, opt_state))
+      #logging.info("mcmc_width: ", jax.tree_util.tree_map(jax.numpy.shape, mcmc_width))
+
+      #if is_main_process():
+        #logging.info("main process shapes:")
+        #logging.info("params: ", jax.tree_util.tree_map(jax.numpy.shape, params))
+        #logging.info("data: ", jax.tree_util.tree_map(jax.numpy.shape, data))
+        #logging.info("opt_state: ", jax.tree_util.tree_map(jax.numpy.shape, opt_state))
+        #logging.info("mcmc_width: ", jax.tree_util.tree_map(jax.numpy.shape, mcmc_width))
+
       # Checkpointing
       if should_save_ckpt(t, time_of_last_ckpt):
           # no checkpointing in inference mode
           if cfg.optim.optimizer != 'none':
             checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width, sharded_key)
           time_of_last_ckpt = time.time()
+          if isinstance(writer, writers.Writer):
+              writer.flush()
 
 
 def make_test_cfg(_cfg):

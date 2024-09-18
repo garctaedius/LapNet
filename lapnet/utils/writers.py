@@ -28,6 +28,12 @@ class DummyWriter(contextlib.AbstractContextManager):
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
+    def write(self, t, **data):
+        pass
+
+    def flush(self):
+        pass
+
 class Writer(contextlib.AbstractContextManager):
   """Write data to CSV, as well as logging data to stdout if desired."""
 
@@ -86,7 +92,7 @@ class Writer(contextlib.AbstractContextManager):
     # write the data to abseil logs
     if self._log:
       logging.info('Iteration %s: %s', t, data)
-
+  
   def flush(self):
     self._file.flush()
 

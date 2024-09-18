@@ -21,14 +21,20 @@ from absl import app
 from absl import flags
 from absl import logging
 from jax.config import config as jax_config
+import jax.distributed
 from lapnet import base_config
 from lapnet import train
 from ml_collections.config_flags import config_flags
 import os
 os.environ['NVIDIA_TF32_OVERRIDE']="0"
 
-logging.get_absl_handler().python_handler.stream = sys.stdout
-logging.set_verbosity(logging.INFO)
+# Only log on main process
+if int(os.environ.get("SLURM_PROCID", 0)) == 0:
+    logging.get_absl_handler().python_handler.stream = sys.stdout
+    logging.set_verbosity(logging.INFO)
+else:
+    logging.get_absl_handler().python_handler.stream = sys.stdout
+    logging.set_verbosity(logging.WARNING)
 
 # internal imports
 
@@ -36,13 +42,16 @@ FLAGS = flags.FLAGS
 
 config_flags.DEFINE_config_file('config', None, 'Path to config file.')
 
+# Allow multi node training
+if int(os.environ.get("SLURM_NTASKS", 1)) > 1:
+  jax.distributed.initialize()
 
 def main(_):
   cfg = FLAGS.config
   cfg = base_config.resolve(cfg)
   if cfg.use_x64:
     jax_config.update("jax_enable_x64", True)
-
+  
   logging.info('System config:\n\n%s', cfg)
   train.train(cfg)
 
